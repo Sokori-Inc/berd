@@ -36,6 +36,17 @@ function Assert-NoThrow {
     }
 }
 
+# Denylist of the PowerShell 6+-only constructs that have actually bitten the
+# Windows scripts: the [semver] type accelerator, Start-ThreadJob, and
+# ForEach-Object -Parallel. It is deliberately not a general 5.1 compatibility
+# checker; that guarantee comes from CI running this whole suite under
+# powershell.exe ("Run Windows script tests under Windows PowerShell 5.1" in
+# .github/workflows/ci.yml).
+function Test-PowerShell7OnlyConstruct {
+    param([string]$Text)
+    return [bool]($Text -match '\[semver\]|Start-ThreadJob|ForEach-Object[^\r\n]*-Parallel\b')
+}
+
 $oldGooseDevRoot = $env:GOOSE_DEV_ROOT
 $oldGooseRepo = $env:GOOSE_DEV_REPO
 $oldGooseTarget = $env:GOOSE_DEV_CARGO_TARGET_DIR
@@ -159,10 +170,40 @@ try {
         ($bundleScript -notmatch 'NotePropertyName version -NotePropertyValue \$resolvedVersion\.Version') $true
     Assert-Equal "Tauri config preserves prerelease package identity" `
         ($bundleScript -match 'NotePropertyName version -NotePropertyValue \$resolvedVersion\.RichVersion') $true
-    Assert-Equal "native updater orders rc.2 after rc.1" `
-        ([semver]"1.2.3-rc.2" -gt [semver]"1.2.3-rc.1") $true
-    Assert-Equal "native updater orders stable after prerelease" `
-        ([semver]"1.2.3" -gt [semver]"1.2.3-rc.2") $true
+    # These two assertions exercise System.Management.Automation.SemanticVersion,
+    # the type behind the PowerShell 6+ semver accelerator, not Berd code.
+    # Windows PowerShell 5.1, which every justfile Windows recipe runs, has no
+    # such type, so only check the ordering where it exists.
+    $semanticVersionType = "System.Management.Automation.SemanticVersion" -as [type]
+    if ($null -ne $semanticVersionType) {
+        Assert-Equal "native updater orders rc.2 after rc.1" `
+            (("1.2.3-rc.2" -as $semanticVersionType) -gt ("1.2.3-rc.1" -as $semanticVersionType)) $true
+        Assert-Equal "native updater orders stable after prerelease" `
+            (("1.2.3" -as $semanticVersionType) -gt ("1.2.3-rc.2" -as $semanticVersionType)) $true
+    } else {
+        Write-Host "SKIP native updater semver ordering (PowerShell $($PSVersionTable.PSVersion) has no SemanticVersion type)" -ForegroundColor Yellow
+    }
+
+    # Pin the limited contract of Test-PowerShell7OnlyConstruct: each of the
+    # three denylisted constructs is detected, and look-alike 5.1-safe lines
+    # are not. This is a known-offender scan, not a full 5.1 compatibility
+    # check; the real guarantee is CI running this suite under powershell.exe.
+    Assert-Equal "PowerShell 6+ scan detects [semver]" (Test-PowerShell7OnlyConstruct '[semver]"1.2.3"') $true
+    Assert-Equal "PowerShell 6+ scan detects Start-ThreadJob" (Test-PowerShell7OnlyConstruct 'Start-ThreadJob { }') $true
+    Assert-Equal "PowerShell 6+ scan detects ForEach-Object -Parallel" (Test-PowerShell7OnlyConstruct '1..3 | ForEach-Object -Parallel { $_ }') $true
+    Assert-Equal "PowerShell 6+ scan ignores plain ForEach-Object" (Test-PowerShell7OnlyConstruct 'ForEach-Object { $_ }') $false
+    Assert-Equal "PowerShell 6+ scan ignores the word semver in a string" (Test-PowerShell7OnlyConstruct '$x = "semver"') $false
+    Assert-Equal "PowerShell 6+ scan ignores Start-Job" (Test-PowerShell7OnlyConstruct 'Start-Job { }') $false
+
+    # This harness holds the fixtures above (which spell out the denylisted
+    # tokens) and already runs under 5.1 in CI, so it is exempt from the scan.
+    $windowsScripts = Get-ChildItem -Path $PSScriptRoot -File |
+        Where-Object { $_.Extension -in @(".ps1", ".psm1") -and $_.Name -ne "Test-WindowsDev.ps1" }
+    $powerShell7OnlyOffenders = @($windowsScripts | Where-Object {
+        Test-PowerShell7OnlyConstruct (Get-Content -Raw -LiteralPath $_.FullName)
+    } | ForEach-Object { $_.Name })
+    Assert-Equal "Windows scripts avoid the known PowerShell 6+-only constructs ([semver], Start-ThreadJob, ForEach-Object -Parallel) ($($powerShell7OnlyOffenders -join ', '))" `
+        $powerShell7OnlyOffenders.Count 0
 
     $buildScript = Get-Content -Raw (Join-Path (Get-BerdRepoRoot) "src-tauri\build.rs")
     Assert-Equal "Rust rebuilds when the resolved app version changes" ($buildScript -match 'cargo:rerun-if-env-changed=BERD_APP_VERSION') $true
