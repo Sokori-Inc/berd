@@ -684,6 +684,11 @@ class OpenAiRealtimeConversationRuntime {
 
       const transport = {
         send: (data: string) => {
+          if (
+            this.snapshot.state === "stopping" ||
+            this.snapshot.state === "off"
+          )
+            return;
           const event = JSON.parse(data) as Record<string, unknown>;
           const sent = this.realtimeRuntimeSendQueue.then(() =>
             sendOpenAiRealtimeSpokespersonRuntimeEvent(sessionId, event),
@@ -879,6 +884,16 @@ class OpenAiRealtimeConversationRuntime {
                     },
                     false,
                   );
+                } else if (bridgeEvent.type === "transcript.discarded") {
+                  const messageId = transcriptMessageIds.get(
+                    bridgeEvent.itemId,
+                  );
+                  if (messageId) {
+                    useChatStore
+                      .getState()
+                      .removeMessage(ownerSessionId, messageId);
+                    transcriptMessageIds.delete(bridgeEvent.itemId);
+                  }
                 }
               }
               for (const handoff of reduction.acceptedHandoffs) {
@@ -1148,13 +1163,13 @@ class OpenAiRealtimeConversationRuntime {
     this.nativeMicrophone = null;
     const realtimeRuntimeSessionId = this.realtimeRuntimeSessionId;
     this.realtimeRuntimeSessionId = null;
+    await this.realtimeRuntimeSendQueue.catch(() => undefined);
     if (realtimeRuntimeSessionId) {
       await stopOpenAiRealtimeSpokespersonRuntime(
         realtimeRuntimeSessionId,
       ).catch(() => undefined);
     }
     await this.realtimeProtocolQueue.catch(() => undefined);
-    await this.realtimeRuntimeSendQueue.catch(() => undefined);
     const flushedPendingEvents =
       (await this.flushPendingExpertEvents?.()) ?? false;
     if (flushedPendingEvents) {
