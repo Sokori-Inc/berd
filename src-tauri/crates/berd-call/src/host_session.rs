@@ -25,6 +25,7 @@ use berd_call::protocol::{
 };
 use berd_call::PocketAudioPlayer;
 
+use crate::codex::{self, CodexRecord, CodexRelay, CodexTarget};
 use crate::host_control::{ControlServer, HostControl};
 use crate::session_audio::{
     AUDIO_BEGIN_KIND, AUDIO_CANCEL_KIND, AUDIO_CHUNK_KIND, AUDIO_END_KIND,
@@ -33,19 +34,65 @@ use crate::session_audio::{
 use crate::session_framing::{
     encode_frame, JSON_FRAME_KIND, PCM_FRAME_KIND, SESSION_PROTOCOL_VERSION,
 };
-use crate::StartOptions;
+use crate::{StartOptions, TranscriptDestination};
 
+const NON_BLOCKING_REQUIRES_DELIVERY: &str =
+    "non-blocking speech requires start --stream or --codex for delivery events";
+const CLEAN_STOP: &str = "Berd Call stopped after a stop request. This is a clean shutdown, not a crash. Do not restart it unless asked.";
 const INPUT_FRAME_SAMPLES: usize = 960;
 const MAX_AUDIO_RECORD_BYTES: usize = 4096 * std::mem::size_of::<f32>() + 16;
 
+/// Turns Ctrl-C and SIGTERM into the same stop request `berd-call stop`
+/// sends, so the call ends through its normal shutdown and reports it.
+/// Must run before any other thread starts so every thread inherits the mask.
+pub(crate) fn route_stop_signals(port: u16) -> Result<(), String> {
+    // SAFETY: the set is initialized by sigemptyset before use.
+    let signals = unsafe {
+        let mut signals = std::mem::zeroed::<libc::sigset_t>();
+        libc::sigemptyset(&mut signals);
+        libc::sigaddset(&mut signals, libc::SIGINT);
+        libc::sigaddset(&mut signals, libc::SIGTERM);
+        // An inherited SIG_IGN (e.g. a background job) would discard the
+        // signal before sigwait could receive it.
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        if libc::pthread_sigmask(libc::SIG_BLOCK, &signals, std::ptr::null_mut()) != 0 {
+            return Err("could not route stop signals".into());
+        }
+        signals
+    };
+    thread::Builder::new()
+        .name("berd-call-signals".into())
+        .spawn(move || {
+            let mut stopping = false;
+            loop {
+                let mut signal = 0;
+                // SAFETY: `signals` is blocked on every thread, so sigwait
+                // is the only receiver.
+                if unsafe { libc::sigwait(&signals, &mut signal) } != 0 {
+                    continue;
+                }
+                if stopping {
+                    std::process::exit(130);
+                }
+                stopping = true;
+                thread::spawn(move || {
+                    if crate::host_control::request(port, crate::host_control::ControlRequest::Stop)
+                        .is_err()
+                    {
+                        std::process::exit(130);
+                    }
+                });
+            }
+        })
+        .map(drop)
+        .map_err(|error| format!("could not route stop signals: {error}"))
+}
+
 pub(crate) fn run(options: StartOptions) -> Result<(), String> {
     let server = ControlServer::bind(options.port)?;
-    if options.stream {
-        println!("cursor\trole\ttext");
-        std::io::stdout()
-            .flush()
-            .map_err(|error| format!("could not flush stream header: {error}"))?;
-    }
+    let transcript = Arc::new(Transcript::for_options(&options)?);
+    transcript.start()?;
     let non_blocking = Arc::new(AtomicBool::new(options.non_blocking));
     let stop_requested = Arc::new(AtomicBool::new(false));
     let mut session = SessionStart {
@@ -59,30 +106,123 @@ pub(crate) fn run(options: StartOptions) -> Result<(), String> {
         match run_session(
             &server,
             session,
-            options.stream,
+            &transcript,
             &non_blocking,
             &stop_requested,
-        )? {
-            None => return Ok(()),
+        ) {
+            Ok(None) => {
+                transcript.finish(CLEAN_STOP);
+                return Ok(());
+            }
             // A stop recorded while the old session was shutting down wins
             // over the restart it would otherwise hand off to.
-            Some(next) if stop_requested.load(Ordering::SeqCst) => {
+            Ok(Some(next)) if stop_requested.load(Ordering::SeqCst) => {
                 if let Some(response) = next.restarted {
                     let _ = response.send(Err("voice call stopped".into()));
                 }
+                transcript.finish(CLEAN_STOP);
                 return Ok(());
             }
-            Some(next) => {
-                if options.stream {
-                    println!("0\tlifecycle\tsession restarted; transcript cursors reset");
-                    std::io::stdout()
-                        .flush()
-                        .map_err(|error| format!("could not flush voice stream: {error}"))?;
-                }
+            Ok(Some(next)) => {
                 session = next;
+            }
+            Err(message) => {
+                transcript.finish(&format!("Berd Call failed: {message}"));
+                return Err(message);
             }
         }
     }
+}
+
+/// Where live transcript records go: nowhere, stdout TSV, or a Codex task.
+pub(crate) enum Transcript {
+    Silent,
+    Stdout,
+    Codex(CodexRelay),
+}
+
+impl Transcript {
+    fn for_options(options: &StartOptions) -> Result<Self, String> {
+        Ok(match options.transcript {
+            TranscriptDestination::None => Self::Silent,
+            TranscriptDestination::Stdout => Self::Stdout,
+            TranscriptDestination::Codex => {
+                let target = CodexTarget::from_environment()?;
+                let executable = std::env::current_exe().map_err(|error| {
+                    format!("could not resolve the berd-call executable: {error}")
+                })?;
+                Self::Codex(CodexRelay::start(
+                    target,
+                    codex::guidance(&executable, options.port),
+                ))
+            }
+        })
+    }
+
+    /// Whether interruption and failure reports reach the agent.
+    fn delivers(&self) -> bool {
+        !matches!(self, Self::Silent)
+    }
+
+    fn start(&self) -> Result<(), String> {
+        match self {
+            Self::Stdout => print_flushed("cursor\trole\ttext"),
+            Self::Codex(_) => {
+                println!("Berd Call is delivering transcripts to this Codex task.");
+                Ok(())
+            }
+            Self::Silent => Ok(()),
+        }
+    }
+
+    fn record(
+        &self,
+        cursor: Option<u64>,
+        role: &str,
+        handoff_id: Option<&str>,
+        text: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Silent => Ok(()),
+            Self::Stdout => print_flushed(&format!(
+                "{}\t{role}\t{}",
+                cursor.unwrap_or_default(),
+                stream_text(text)
+            )),
+            Self::Codex(relay) => {
+                relay.send(CodexRecord {
+                    cursor,
+                    role: role.to_string(),
+                    handoff_id: handoff_id.map(str::to_string),
+                    text: text.to_string(),
+                });
+                Ok(())
+            }
+        }
+    }
+
+    /// Reports why the call ended, then drains any pending delivery.
+    fn finish(&self, text: &str) {
+        match self {
+            Self::Silent => {}
+            Self::Stdout => {
+                let _ = self.record(None, "lifecycle", None, text);
+            }
+            Self::Codex(relay) => relay.finish(Some(CodexRecord {
+                cursor: None,
+                role: "lifecycle".into(),
+                handoff_id: None,
+                text: text.to_string(),
+            })),
+        }
+    }
+}
+
+fn print_flushed(line: &str) -> Result<(), String> {
+    println!("{line}");
+    std::io::stdout()
+        .flush()
+        .map_err(|error| format!("could not flush voice stream: {error}"))
 }
 
 struct SessionStart {
@@ -96,7 +236,7 @@ struct SessionStart {
 fn run_session(
     server: &ControlServer,
     start: SessionStart,
-    stream: bool,
+    transcript: &Arc<Transcript>,
     non_blocking: &Arc<AtomicBool>,
     stop_requested: &Arc<AtomicBool>,
 ) -> Result<Option<SessionStart>, String> {
@@ -112,7 +252,7 @@ fn run_session(
         expert_spokesperson,
         muted,
         input_during_tts,
-        stream,
+        transcript,
         non_blocking,
         stop_requested,
     );
@@ -133,6 +273,12 @@ fn run_session(
         }
     };
     if let Some(response) = restarted {
+        transcript.record(
+            Some(0),
+            "lifecycle",
+            None,
+            "session restarted; transcript cursors reset",
+        )?;
         let _ = response.send(control.status());
     }
     let session_control = Arc::clone(&control);
@@ -193,7 +339,7 @@ fn start_session(
     expert_spokesperson: bool,
     muted: bool,
     input_during_tts: InputDuringTtsPolicy,
-    stream: bool,
+    transcript: &Arc<Transcript>,
     non_blocking: &Arc<AtomicBool>,
     stop_requested: &Arc<AtomicBool>,
 ) -> Result<StartedSession, String> {
@@ -227,7 +373,7 @@ fn start_session(
         command_rx,
         audio_command_tx,
         Arc::clone(&ready.session),
-        stream,
+        Arc::clone(transcript),
         expert_spokesperson,
     );
     actor.muted.store(muted, Ordering::SeqCst);
@@ -245,7 +391,7 @@ fn start_session(
         non_blocking: Arc::clone(non_blocking),
         stop_requested: Arc::clone(stop_requested),
         muted: Arc::clone(&actor.muted),
-        stream,
+        transcript: Arc::clone(transcript),
         session_arguments: arguments,
     });
     Ok(StartedSession {
@@ -316,7 +462,7 @@ struct SessionControl {
     non_blocking: Arc<AtomicBool>,
     stop_requested: Arc<AtomicBool>,
     muted: Arc<AtomicBool>,
-    stream: bool,
+    transcript: Arc<Transcript>,
     session_arguments: Vec<String>,
 }
 
@@ -406,8 +552,8 @@ impl HostControl for SessionControl {
     }
 
     fn set_non_blocking(&self, enabled: bool) -> Result<Value, String> {
-        if enabled && !self.stream {
-            return Err("non-blocking speech requires start --stream for delivery events".into());
+        if enabled && !self.transcript.delivers() {
+            return Err(NON_BLOCKING_REQUIRES_DELIVERY.into());
         }
         self.non_blocking.store(enabled, Ordering::SeqCst);
         self.status()
@@ -485,7 +631,7 @@ struct SessionActor {
     pending_settings: std::collections::HashMap<u64, SyncSender<Result<Value, String>>>,
     waiting_speaks: VecDeque<ControlCommand>,
     session: Arc<Mutex<VoiceSessionSnapshot>>,
-    stream: bool,
+    transcript: Arc<Transcript>,
     expert_spokesperson: bool,
     stopping: bool,
     restart: Option<PendingRestart>,
@@ -499,7 +645,7 @@ impl SessionActor {
         commands: Receiver<ControlCommand>,
         audio_commands: SyncSender<AudioCommand>,
         session: Arc<Mutex<VoiceSessionSnapshot>>,
-        stream: bool,
+        transcript: Arc<Transcript>,
         expert_spokesperson: bool,
     ) -> Self {
         Self {
@@ -512,7 +658,7 @@ impl SessionActor {
             pending_settings: std::collections::HashMap::new(),
             waiting_speaks: VecDeque::new(),
             session,
-            stream,
+            transcript,
             expert_spokesperson,
             stopping: false,
             restart: None,
@@ -600,10 +746,8 @@ impl SessionActor {
                 non_blocking,
                 response,
             } => {
-                if non_blocking && !self.stream {
-                    let _ = response.send(Err(
-                        "non-blocking speech requires start --stream for delivery events".into(),
-                    ));
+                if non_blocking && !self.transcript.delivers() {
+                    let _ = response.send(Err(NON_BLOCKING_REQUIRES_DELIVERY.into()));
                     return Ok(());
                 }
                 if self.pending_speak.is_some() {
@@ -809,8 +953,12 @@ impl SessionActor {
                     Err(message) => json!({"status":"failed", "message":message}),
                 };
                 if should_notify_delivery(&result) {
-                    println!("{}\tspeech_result\t{}", pending.prepare_id, result);
-                    let _ = std::io::stdout().flush();
+                    let _ = self.transcript.record(
+                        Some(pending.prepare_id),
+                        "speech_result",
+                        None,
+                        &result.to_string(),
+                    );
                 }
             }
         }
@@ -822,26 +970,20 @@ impl SessionActor {
         origin: Option<UtteranceOrigin>,
         text: &str,
     ) -> Result<(), String> {
-        if !self.stream {
-            return Ok(());
-        }
         let role = utterance_origin_name(origin.unwrap_or(UtteranceOrigin::User));
-        println!("{token}\t{role}\t{}", stream_text(text));
-        std::io::stdout()
-            .flush()
-            .map_err(|error| format!("could not flush voice stream: {error}"))
+        self.transcript.record(Some(token), role, None, text)
     }
 
     fn stream_expert_delivery(&self, events: &[RealtimeExpertDeliveryEvent]) -> Result<(), String> {
-        if !self.stream {
-            return Ok(());
+        for event in events {
+            self.transcript.record(
+                Some(event.cursor),
+                expert_delivery_role_name(event.role),
+                event.handoff_id.as_deref(),
+                &event.text,
+            )?;
         }
-        for (cursor, role, text) in expert_delivery_rows(events) {
-            println!("{cursor}\t{role}\t{text}");
-        }
-        std::io::stdout()
-            .flush()
-            .map_err(|error| format!("could not flush expert delivery: {error}"))
+        Ok(())
     }
 
     fn next_id(&mut self) -> u64 {
@@ -861,19 +1003,6 @@ impl SessionActor {
             }
         }
     }
-}
-
-fn expert_delivery_rows(events: &[RealtimeExpertDeliveryEvent]) -> Vec<(u64, String, String)> {
-    events
-        .iter()
-        .map(|event| {
-            (
-                event.cursor,
-                expert_delivery_role_name(event.role).to_string(),
-                stream_text(&event.text),
-            )
-        })
-        .collect()
 }
 
 fn receive_ready(events: &Receiver<SessionMessage>) -> Result<ReadyState, String> {
@@ -932,6 +1061,12 @@ impl SessionProcess {
             .stderr(Stdio::inherit());
         unsafe {
             command.pre_exec(move || {
+                // The host owns Ctrl-C: keep terminal signals away from the
+                // child and restore the default mask the host blocked.
+                libc::setpgid(0, 0);
+                let mut signals = std::mem::zeroed::<libc::sigset_t>();
+                libc::sigemptyset(&mut signals);
+                libc::pthread_sigmask(libc::SIG_SETMASK, &signals, std::ptr::null_mut());
                 libc::close(read_fd);
                 let flags = libc::fcntl(write_fd, libc::F_GETFD);
                 if flags < 0 || libc::fcntl(write_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
@@ -1723,7 +1858,7 @@ mod tests {
             commands,
             audio_commands,
             session,
-            true,
+            Arc::new(Transcript::Stdout),
             false,
         )
     }
@@ -1772,7 +1907,7 @@ mod tests {
             non_blocking: Arc::new(AtomicBool::new(false)),
             stop_requested: Arc::clone(&stop_requested),
             muted: Arc::new(AtomicBool::new(false)),
-            stream: false,
+            transcript: Arc::new(Transcript::Silent),
             session_arguments: vec!["session".into()],
         };
         drop(receiver);
@@ -1792,7 +1927,7 @@ mod tests {
             non_blocking: Arc::new(AtomicBool::new(false)),
             stop_requested: Arc::new(AtomicBool::new(false)),
             muted: Arc::new(AtomicBool::new(false)),
-            stream: false,
+            transcript: Arc::new(Transcript::Silent),
             session_arguments: vec!["session".into()],
         };
         let worker = thread::spawn(move || match receiver.recv().unwrap() {
@@ -1923,31 +2058,6 @@ mod tests {
         assert_eq!(
             take_audio_record(&mut bytes).unwrap(),
             Some((AUDIO_CANCEL_KIND, 7_u64.to_le_bytes().to_vec()))
-        );
-    }
-
-    #[test]
-    fn expert_delivery_preserves_causal_rows() {
-        let rows = expert_delivery_rows(&[
-            RealtimeExpertDeliveryEvent {
-                cursor: 4,
-                role: RealtimeExpertDeliveryRole::User,
-                text: "hello".into(),
-                handoff_id: None,
-            },
-            RealtimeExpertDeliveryEvent {
-                cursor: 5,
-                role: RealtimeExpertDeliveryRole::SpokespersonInterrupted,
-                text: "hi\nthere".into(),
-                handoff_id: None,
-            },
-        ]);
-        assert_eq!(
-            rows,
-            vec![
-                (4, "user".into(), "hello".into()),
-                (5, "spokesperson_interrupted".into(), "hi there".into())
-            ]
         );
     }
 
