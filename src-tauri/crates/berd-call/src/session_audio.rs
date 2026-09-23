@@ -20,7 +20,8 @@ pub const MAX_AUDIO_CHUNK_FRAMES: usize = 4096;
 const MIN_ACCEPTED_AUDIO_RUNWAY_MS: f64 = 400.0;
 const MAX_ACCEPTED_NOT_PLAYED_CHUNKS: usize = 64;
 
-const AUDIO_OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
+const AUDIO_PIPE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const AUDIO_OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 pub const AUDIO_CANCELLED: &str = "remote PCM output was cancelled";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -128,7 +129,7 @@ impl AudioPipeTransport {
         record.extend_from_slice(&length.to_le_bytes());
         record.extend_from_slice(payload);
 
-        let deadline = Instant::now() + AUDIO_OPERATION_TIMEOUT;
+        let deadline = Instant::now() + AUDIO_PIPE_WRITE_TIMEOUT;
         let file = self.file.lock().expect("audio pipe lock");
         let fd = file.as_raw_fd();
         let mut offset = 0;
@@ -1116,6 +1117,45 @@ mod tests {
             .handle_ack(AudioHostAck::ChunkAccepted { sequence: 2 })
             .unwrap();
         worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn rapid_resume_waits_for_host_suspension_acknowledgement() {
+        let (output, mut host, controls) = fixture_with_control(
+            TtsPcmSpec {
+                sample_rate: 24_000,
+                playback_rate: 1.0,
+            },
+            AUDIO_OPERATION_TIMEOUT,
+        );
+        start(&output, &mut host);
+        output.request_suspend().unwrap();
+        assert_eq!(
+            controls.try_recv().unwrap(),
+            AudioOutputControlRequest::Suspend { speech_id: 7 }
+        );
+        output.request_resume().unwrap();
+        assert!(matches!(
+            controls.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        output
+            .handle_ack(AudioHostAck::Suspended { played_frames: 0 })
+            .unwrap();
+        assert_eq!(
+            controls.try_recv().unwrap(),
+            AudioOutputControlRequest::Resume { speech_id: 7 }
+        );
+        output
+            .handle_ack(AudioHostAck::Resumed { played_frames: 0 })
+            .unwrap();
+        assert!(matches!(
+            controls.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let state = output.state.lock().unwrap();
+        assert_eq!(state.suspension, SuspensionPhase::Running);
+        assert!(state.suspension_deadline.is_none());
     }
 
     #[test]

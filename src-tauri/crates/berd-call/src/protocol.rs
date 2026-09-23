@@ -6,7 +6,7 @@ use crate::{
     ConversationStatus, StatusSoundSettings, TtsConfigurationSnapshot, TtsSettings,
 };
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionRequest {
     Hello {
@@ -115,7 +115,7 @@ pub enum SessionRequest {
     Shutdown,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct PendingUtterance {
     pub token: u64,
     pub text: String,
@@ -123,7 +123,7 @@ pub struct PendingUtterance {
     pub origin: Option<UtteranceOrigin>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UtteranceOrigin {
     User,
@@ -131,7 +131,7 @@ pub enum UtteranceOrigin {
     Handoff,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NotAdmittedReason {
     Paused,
@@ -141,48 +141,48 @@ pub enum NotAdmittedReason {
     InvalidHandoff,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CancelOutcome {
     Cancelled,
     Stale,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputReadyOutcome {
     Accepted,
     Stale,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct VoiceSessionSnapshot {
     pub tts: TtsConfigurationSnapshot,
     pub input_during_tts: InputDuringTtsSnapshot,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TtsSettingsOutcome {
     Applied,
     Rejected,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InputDuringTtsOutcome {
     Applied,
     Rejected,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DismissHandoffsOutcome {
     Applied,
     Rejected,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExpertTurnOutcome {
     Complete,
@@ -191,7 +191,7 @@ pub enum ExpertTurnOutcome {
     Rejected,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionMessage {
     Ready {
@@ -334,6 +334,13 @@ pub enum SessionMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_decodes_realtime_ready_snapshot() {
+        let message = r#"{"type":"ready","id":1,"protocol":5,"session":{"tts":{"revision":1,"backend":"openai","model":"gpt-realtime-2.1","voice":"marin","rate":1.0},"input_during_tts":{"revision":1,"policy":"allow_barge_in"}}}"#;
+        let decoded = serde_json::from_str::<SessionMessage>(message).unwrap();
+        assert!(matches!(decoded, SessionMessage::Ready { id: 1, .. }));
+    }
 
     #[test]
     fn protocol_is_stably_tagged() {
