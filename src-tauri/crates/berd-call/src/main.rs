@@ -501,8 +501,12 @@ fn main() {
             }
         }
         Some("speak") => {
-            let (port, acknowledgement, resolved_handoff_ids, text) =
-                parse_or_exit(parse_speak_control_args(&args), &args);
+            let SpeakOptions {
+                port,
+                acknowledgement,
+                resolved_handoff_ids,
+                text,
+            } = parse_or_exit(parse_speak_control_args(&args), &args);
             let response = host_control::request(
                 port,
                 host_control::ControlRequest::Speak {
@@ -519,6 +523,13 @@ fn main() {
             let response = host_control::request(port, host_control::ControlRequest::Status)
                 .unwrap_or_else(|error| operational_error("status", error));
             print_pretty_json(&response).unwrap_or_else(|error| operational_error("status", error));
+        }
+        Some("settings") => {
+            let (port, request) = parse_or_exit(parse_host_settings_args(&args), &args);
+            let response = host_control::request(port, request)
+                .unwrap_or_else(|error| operational_error("settings", error));
+            print_pretty_json(&response)
+                .unwrap_or_else(|error| operational_error("settings", error));
         }
         Some("stop") => {
             let port = parse_or_exit(parse_control_port(&args), &args);
@@ -611,14 +622,32 @@ fn main() {
 struct StartOptions {
     port: u16,
     stream: bool,
+    non_blocking: bool,
     expert_spokesperson: bool,
     session_arguments: Vec<String>,
+}
+
+fn validate_session_arguments(arguments: &[String]) -> Result<bool, String> {
+    if arguments
+        .iter()
+        .any(|argument| argument == "--pcm-output-fd")
+    {
+        return Err("berd-call start owns its PCM output descriptor".into());
+    }
+    let mut validation = vec!["berd-call".to_string()];
+    validation.extend(arguments.iter().cloned());
+    match parse_args(&validation) {
+        Ok(config) => Ok(config.mode == SessionMode::ExpertSpokesperson),
+        Err(ParseFailure::HelpRequested) => Err("session options must not request help".into()),
+        Err(ParseFailure::Usage(message)) => Err(message),
+    }
 }
 
 fn parse_start_args(args: &[String]) -> Result<StartOptions, ParseFailure> {
     let mut port = 5222_u16;
     let mut port_seen = false;
     let mut stream = false;
+    let mut non_blocking = false;
     let mut session_arguments = vec!["session".to_string()];
     let mut index = 2;
     while index < args.len() {
@@ -629,6 +658,11 @@ fn parse_start_args(args: &[String]) -> Result<StartOptions, ParseFailure> {
                 index += 1;
             }
             "--stream" => return Err("--stream may be provided only once".into()),
+            "--non-blocking" if !non_blocking => {
+                non_blocking = true;
+                index += 1;
+            }
+            "--non-blocking" => return Err("--non-blocking may be provided only once".into()),
             "--port" if !port_seen => {
                 let value = args
                     .get(index + 1)
@@ -647,20 +681,30 @@ fn parse_start_args(args: &[String]) -> Result<StartOptions, ParseFailure> {
             }
         }
     }
-    let mut validation = vec!["berd-call".to_string()];
-    validation.extend(session_arguments.iter().cloned());
-    let config = parse_args(&validation)?;
+    let expert_spokesperson = validate_session_arguments(&session_arguments)?;
+    if non_blocking && !stream {
+        return Err(
+            "non-blocking speech requires --stream for interruption and failure events".into(),
+        );
+    }
     Ok(StartOptions {
         port,
         stream,
-        expert_spokesperson: config.mode == SessionMode::ExpertSpokesperson,
+        non_blocking,
+        expert_spokesperson,
         session_arguments,
     })
 }
 
-fn parse_speak_control_args(
-    args: &[String],
-) -> Result<(u16, Option<u64>, Vec<String>, String), ParseFailure> {
+#[derive(Debug, PartialEq)]
+struct SpeakOptions {
+    port: u16,
+    acknowledgement: Option<u64>,
+    resolved_handoff_ids: Vec<String>,
+    text: String,
+}
+
+fn parse_speak_control_args(args: &[String]) -> Result<SpeakOptions, ParseFailure> {
     let mut port = 5222_u16;
     let mut port_seen = false;
     let mut acknowledgement = None;
@@ -720,7 +764,97 @@ fn parse_speak_control_args(
     if text.len() > MAX_SPEAK_TEXT_BYTES {
         return Err("speak text is larger than 16 KiB".into());
     }
-    Ok((port, acknowledgement, resolved_handoff_ids, text))
+    Ok(SpeakOptions {
+        port,
+        acknowledgement,
+        resolved_handoff_ids,
+        text,
+    })
+}
+
+fn parse_host_settings_args(
+    args: &[String],
+) -> Result<(u16, host_control::ControlRequest), ParseFailure> {
+    let mut port = None;
+    let mut request = None;
+    let mut index = 2;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        if flag == "--port" {
+            if port.is_some() {
+                return Err("--port may be provided only once".into());
+            }
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| "--port requires a value".to_string())?;
+            port = Some(parse_port(value)?);
+            index += 2;
+            continue;
+        }
+        let setting = match flag {
+            "-h" | "--help" => return Err(ParseFailure::HelpRequested),
+            "--restart" => {
+                // Restart consumes the rest of argv as session options.
+                if request.is_some() {
+                    return Err(SETTINGS_CHOICE_ERROR.into());
+                }
+                let mut session_arguments = vec!["session".to_string()];
+                session_arguments.extend(args[index + 1..].iter().cloned());
+                validate_session_arguments(&session_arguments)?;
+                request = Some(host_control::ControlRequest::Restart { session_arguments });
+                break;
+            }
+            "--non-blocking" => host_control::ControlRequest::NonBlocking {
+                enabled: parse_bool_setting(flag, args.get(index + 1))?,
+            },
+            "--muted" => host_control::ControlRequest::Muted {
+                muted: parse_bool_setting(flag, args.get(index + 1))?,
+            },
+            "--input-during-tts" => host_control::ControlRequest::InputDuringTts {
+                policy: match args.get(index + 1).map(String::as_str) {
+                    Some("allow") => berd_call::input::InputDuringTtsPolicy::AllowBargeIn,
+                    Some("suppress") => berd_call::input::InputDuringTtsPolicy::SuppressInput,
+                    _ => return Err("--input-during-tts requires allow or suppress".into()),
+                },
+            },
+            "--rate" => host_control::ControlRequest::Rate {
+                rate: args
+                    .get(index + 1)
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .filter(|rate| rate.is_finite() && *rate > 0.0)
+                    .ok_or("--rate requires a positive number")?,
+            },
+            "--tts" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--tts requires a JSON settings object".to_string())?;
+                host_control::ControlRequest::TtsSettings {
+                    settings: serde_json::from_str(value)
+                        .map_err(|error| format!("invalid TTS settings: {error}"))?,
+                }
+            }
+            _ => return Err(format!("unrecognized settings option: {flag}").into()),
+        };
+        index += 2;
+        if request.replace(setting).is_some() {
+            return Err(SETTINGS_CHOICE_ERROR.into());
+        }
+    }
+    Ok((
+        port.unwrap_or(5222),
+        request.ok_or_else(|| ParseFailure::Usage(SETTINGS_CHOICE_ERROR.into()))?,
+    ))
+}
+
+const SETTINGS_CHOICE_ERROR: &str =
+    "provide exactly one of --non-blocking, --rate, --tts, --input-during-tts, --muted, or --restart";
+
+fn parse_bool_setting(flag: &str, value: Option<&String>) -> Result<bool, String> {
+    match value.map(String::as_str) {
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        _ => Err(format!("{flag} requires true or false")),
+    }
 }
 
 fn parse_control_port(args: &[String]) -> Result<u16, ParseFailure> {
@@ -10769,7 +10903,102 @@ mod tests {
     }
 
     #[test]
+    fn settings_rate_changes_only_the_speech_rate() {
+        let (_, request) =
+            parse_host_settings_args(&args(&["berd-call", "settings", "--rate", "1.5"])).unwrap();
+        assert!(matches!(request, host_control::ControlRequest::Rate { rate } if rate == 1.5));
+        assert!(
+            parse_host_settings_args(&args(&["berd-call", "settings", "--rate", "fast"])).is_err()
+        );
+    }
+
+    #[test]
     fn control_command_parsers_are_closed_and_correlated() {
+        let (port, request) = parse_host_settings_args(&args(&[
+            "berd-call",
+            "settings",
+            "--port",
+            "5340",
+            "--tts",
+            r#"{"backend":"siri","voice":"Aaron","language":"en-US","rate":1.5}"#,
+        ]))
+        .unwrap();
+        assert_eq!(port, 5340);
+        assert!(
+            matches!(request, host_control::ControlRequest::TtsSettings { settings: TtsSettings::Siri { rate, .. } } if rate == 1.5)
+        );
+        assert!(
+            parse_host_settings_args(&args(&["berd-call", "settings", "--tts", "{}"])).is_err()
+        );
+        assert!(matches!(
+            parse_host_settings_args(&args(&[
+                "berd-call",
+                "settings",
+                "--input-during-tts",
+                "suppress",
+            ]))
+            .unwrap()
+            .1,
+            host_control::ControlRequest::InputDuringTts {
+                policy: berd_call::input::InputDuringTtsPolicy::SuppressInput
+            }
+        ));
+        assert!(matches!(
+            parse_host_settings_args(&args(&["berd-call", "settings", "--muted", "true"]))
+                .unwrap()
+                .1,
+            host_control::ControlRequest::Muted { muted: true }
+        ));
+        assert!(matches!(
+            parse_host_settings_args(&args(&[
+                "berd-call",
+                "settings",
+                "--port",
+                "5340",
+                "--restart",
+                "--voice",
+                "Aaron",
+                "--language",
+                "en-US",
+                "--mode",
+                "expert-spokesperson",
+            ]))
+            .unwrap(),
+            (5340, host_control::ControlRequest::Restart { session_arguments })
+                if session_arguments.last().map(String::as_str) == Some("expert-spokesperson")
+        ));
+        assert!(parse_host_settings_args(&args(&[
+            "berd-call",
+            "settings",
+            "--restart",
+            "--mode",
+            "sideways",
+        ]))
+        .is_err());
+        assert!(parse_host_settings_args(&args(&[
+            "berd-call",
+            "settings",
+            "--non-blocking",
+            "true",
+            "--tts",
+            r#"{"backend":"siri","voice":"Aaron","language":"en-US","rate":1.5}"#
+        ]))
+        .is_err());
+        assert!(parse_speak_control_args(&args(&[
+            "berd-call",
+            "speak",
+            "--non-blocking",
+            "hello"
+        ]))
+        .is_err());
+        assert!(parse_speak_control_args(&args(&[
+            "berd-call",
+            "speak",
+            "--non-blocking",
+            "--non-blocking",
+            "hello"
+        ]))
+        .is_err());
         assert_eq!(
             parse_speak_control_args(&args(&[
                 "berd-call",
@@ -10781,7 +11010,12 @@ mod tests {
                 "hello",
             ]))
             .unwrap(),
-            (5300, Some(17), Vec::new(), "hello".into())
+            SpeakOptions {
+                port: 5300,
+                acknowledgement: Some(17),
+                resolved_handoff_ids: Vec::new(),
+                text: "hello".into(),
+            }
         );
         assert_eq!(
             parse_control_port(&args(&["berd-call", "status", "--port", "5301"])).unwrap(),

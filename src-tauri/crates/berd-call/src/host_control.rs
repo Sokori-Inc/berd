@@ -23,6 +23,15 @@ pub(crate) trait HostControl: Send + Sync + 'static {
         resolved_handoff_ids: Vec<String>,
     ) -> Result<Value, String>;
     fn stop(&self) -> Result<Value, String>;
+    fn set_non_blocking(&self, enabled: bool) -> Result<Value, String>;
+    fn set_tts(&self, settings: berd_call::TtsSettings) -> Result<Value, String>;
+    fn set_rate(&self, rate: f32) -> Result<Value, String>;
+    fn set_input_during_tts(
+        &self,
+        policy: berd_call::input::InputDuringTtsPolicy,
+    ) -> Result<Value, String>;
+    fn set_muted(&self, muted: bool) -> Result<Value, String>;
+    fn restart(&self, session_arguments: Vec<String>) -> Result<Value, String>;
 }
 
 pub(crate) struct ControlServer {
@@ -93,6 +102,25 @@ pub(crate) enum ControlRequest {
         resolved_handoff_ids: Vec<String>,
     },
     Stop,
+    NonBlocking {
+        enabled: bool,
+    },
+    TtsSettings {
+        settings: berd_call::TtsSettings,
+    },
+    Rate {
+        rate: f32,
+    },
+    InputDuringTts {
+        policy: berd_call::input::InputDuringTtsPolicy,
+    },
+    Muted {
+        muted: bool,
+    },
+    Restart {
+        #[serde(rename = "sessionArguments")]
+        session_arguments: Vec<String>,
+    },
 }
 
 #[derive(Deserialize, Serialize)]
@@ -104,7 +132,13 @@ struct ControlResponse {
 }
 
 pub(crate) fn request(port: u16, request: ControlRequest) -> Result<Value, String> {
-    let read_timeout = if matches!(&request, ControlRequest::Speak { .. }) {
+    let read_timeout = if matches!(
+        &request,
+        ControlRequest::Speak { .. }
+            | ControlRequest::TtsSettings { .. }
+            | ControlRequest::Rate { .. }
+            | ControlRequest::Restart { .. }
+    ) {
         None
     } else {
         Some(IO_TIMEOUT)
@@ -144,6 +178,12 @@ fn handle_connection(mut stream: TcpStream, control: &dyn HostControl) -> Result
                     control.speak(text, acknowledgement, resolved_handoff_ids)
                 }
                 ControlRequest::Stop => control.stop(),
+                ControlRequest::TtsSettings { settings } => control.set_tts(settings),
+                ControlRequest::Rate { rate } => control.set_rate(rate),
+                ControlRequest::NonBlocking { enabled } => control.set_non_blocking(enabled),
+                ControlRequest::InputDuringTts { policy } => control.set_input_during_tts(policy),
+                ControlRequest::Muted { muted } => control.set_muted(muted),
+                ControlRequest::Restart { session_arguments } => control.restart(session_arguments),
             },
         );
     let response = match result {
@@ -240,6 +280,27 @@ mod tests {
     }
 
     impl HostControl for FakeControl {
+        fn set_tts(&self, settings: berd_call::TtsSettings) -> Result<Value, String> {
+            Ok(serde_json::to_value(settings).unwrap())
+        }
+        fn set_rate(&self, rate: f32) -> Result<Value, String> {
+            Ok(json!({"rate": rate}))
+        }
+        fn set_non_blocking(&self, enabled: bool) -> Result<Value, String> {
+            Ok(json!({"nonBlocking": enabled}))
+        }
+        fn set_input_during_tts(
+            &self,
+            policy: berd_call::input::InputDuringTtsPolicy,
+        ) -> Result<Value, String> {
+            Ok(json!({"inputDuringTts": policy}))
+        }
+        fn set_muted(&self, muted: bool) -> Result<Value, String> {
+            Ok(json!({"muted": muted}))
+        }
+        fn restart(&self, session_arguments: Vec<String>) -> Result<Value, String> {
+            Ok(json!({"sessionArguments": session_arguments}))
+        }
         fn status(&self) -> Result<Value, String> {
             Ok(json!({"running": !self.stopped.load(Ordering::SeqCst)}))
         }

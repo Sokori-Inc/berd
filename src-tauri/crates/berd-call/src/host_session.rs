@@ -40,7 +40,164 @@ const MAX_AUDIO_RECORD_BYTES: usize = 4096 * std::mem::size_of::<f32>() + 16;
 
 pub(crate) fn run(options: StartOptions) -> Result<(), String> {
     let server = ControlServer::bind(options.port)?;
-    let mut child = SessionProcess::spawn(options.session_arguments)?;
+    if options.stream {
+        println!("cursor\trole\ttext");
+        std::io::stdout()
+            .flush()
+            .map_err(|error| format!("could not flush stream header: {error}"))?;
+    }
+    let non_blocking = Arc::new(AtomicBool::new(options.non_blocking));
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let mut session = SessionStart {
+        arguments: options.session_arguments,
+        expert_spokesperson: options.expert_spokesperson,
+        muted: false,
+        input_during_tts: default_input_during_tts_policy(),
+        restarted: None,
+    };
+    loop {
+        match run_session(
+            &server,
+            session,
+            options.stream,
+            &non_blocking,
+            &stop_requested,
+        )? {
+            None => return Ok(()),
+            // A stop recorded while the old session was shutting down wins
+            // over the restart it would otherwise hand off to.
+            Some(next) if stop_requested.load(Ordering::SeqCst) => {
+                if let Some(response) = next.restarted {
+                    let _ = response.send(Err("voice call stopped".into()));
+                }
+                return Ok(());
+            }
+            Some(next) => {
+                if options.stream {
+                    println!("0\tlifecycle\tsession restarted; transcript cursors reset");
+                    std::io::stdout()
+                        .flush()
+                        .map_err(|error| format!("could not flush voice stream: {error}"))?;
+                }
+                session = next;
+            }
+        }
+    }
+}
+
+struct SessionStart {
+    arguments: Vec<String>,
+    expert_spokesperson: bool,
+    muted: bool,
+    input_during_tts: InputDuringTtsPolicy,
+    restarted: Option<SyncSender<Result<Value, String>>>,
+}
+
+fn run_session(
+    server: &ControlServer,
+    start: SessionStart,
+    stream: bool,
+    non_blocking: &Arc<AtomicBool>,
+    stop_requested: &Arc<AtomicBool>,
+) -> Result<Option<SessionStart>, String> {
+    let SessionStart {
+        arguments,
+        expert_spokesperson,
+        muted,
+        input_during_tts,
+        restarted,
+    } = start;
+    let started = start_session(
+        arguments,
+        expert_spokesperson,
+        muted,
+        input_during_tts,
+        stream,
+        non_blocking,
+        stop_requested,
+    );
+    let StartedSession {
+        mut child,
+        mut actor,
+        control,
+        capture,
+        failure_rx,
+        running,
+    } = match started {
+        Ok(started) => started,
+        Err(message) => {
+            if let Some(response) = restarted {
+                let _ = response.send(Err(message.clone()));
+            }
+            return Err(message);
+        }
+    };
+    if let Some(response) = restarted {
+        let _ = response.send(control.status());
+    }
+    let session_control = Arc::clone(&control);
+    let control: Arc<dyn HostControl> = control;
+    while running.load(Ordering::SeqCst) {
+        server.poll(Arc::clone(&control))?;
+        // A stop can be recorded by a control connection that outlived the
+        // session it was sent to, so the flag, not the command, is authoritative.
+        if stop_requested.load(Ordering::SeqCst) {
+            actor.stop()?;
+        }
+        actor.poll()?;
+        match failure_rx.try_recv() {
+            Ok(message) => return Err(message),
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                return Err("voice host workers stopped unexpectedly".into())
+            }
+        }
+        if actor.stopping {
+            running.store(false, Ordering::SeqCst);
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    drop(capture);
+    child.wait_for_exit()?;
+    let restart = actor.restart.take();
+    actor.finish_pending(if restart.is_some() {
+        "voice session restarted"
+    } else {
+        "voice call stopped"
+    });
+    Ok(restart.map(|restart| SessionStart {
+        arguments: restart.arguments,
+        expert_spokesperson: restart.expert_spokesperson,
+        muted: session_control.muted.load(Ordering::SeqCst),
+        input_during_tts: session_control
+            .ready
+            .session
+            .lock()
+            .map(|session| session.input_during_tts.policy)
+            .unwrap_or(input_during_tts),
+        restarted: Some(restart.response),
+    }))
+}
+
+struct StartedSession {
+    child: SessionProcess,
+    actor: SessionActor,
+    control: Arc<SessionControl>,
+    capture: InputCapture,
+    failure_rx: Receiver<String>,
+    running: Arc<AtomicBool>,
+}
+
+fn start_session(
+    arguments: Vec<String>,
+    expert_spokesperson: bool,
+    muted: bool,
+    input_during_tts: InputDuringTtsPolicy,
+    stream: bool,
+    non_blocking: &Arc<AtomicBool>,
+    stop_requested: &Arc<AtomicBool>,
+) -> Result<StartedSession, String> {
+    let mut child = SessionProcess::spawn(arguments.clone())?;
     let writer = Arc::new(Mutex::new(child.take_stdin()?));
     let (event_tx, event_rx) = mpsc::sync_channel(128);
     spawn_stdout_reader(child.take_stdout()?, event_tx)?;
@@ -57,54 +214,48 @@ pub(crate) fn run(options: StartOptions) -> Result<(), String> {
         &writer,
         &SessionRequest::Hello {
             id: 1,
-            input_during_tts: default_input_during_tts_policy(),
+            input_during_tts,
             status_sound_output_device: None,
         },
     )?;
     let ready = receive_ready(&event_rx)?;
     let running = Arc::new(AtomicBool::new(true));
-    let capture = InputCapture::start(Arc::clone(&writer), failure_tx)?;
     let (command_tx, command_rx) = mpsc::sync_channel(32);
-    let control: Arc<dyn HostControl> = Arc::new(SessionControl {
-        commands: command_tx,
-        running: Arc::clone(&running),
-        ready: ready.clone(),
-    });
-
-    if options.stream {
-        println!("cursor\trole\ttext");
-        std::io::stdout()
-            .flush()
-            .map_err(|error| format!("could not flush stream header: {error}"))?;
-    }
-
     let mut actor = SessionActor::new(
-        writer,
+        Arc::clone(&writer),
         event_rx,
         command_rx,
         audio_command_tx,
-        options.stream,
-        options.expert_spokesperson,
+        Arc::clone(&ready.session),
+        stream,
+        expert_spokesperson,
     );
-    while running.load(Ordering::SeqCst) {
-        server.poll(Arc::clone(&control))?;
-        actor.poll()?;
-        match failure_rx.try_recv() {
-            Ok(message) => return Err(message),
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                return Err("voice host workers stopped unexpectedly".into())
-            }
-        }
-        if actor.stopping {
-            running.store(false, Ordering::SeqCst);
-        }
-        thread::sleep(Duration::from_millis(2));
+    actor.muted.store(muted, Ordering::SeqCst);
+    if muted {
+        // Requests and captured PCM share one ordered pipe, so the replacement
+        // session is muted before it can receive any microphone input.
+        let id = actor.next_id();
+        send_request(&writer, &SessionRequest::SetInputMuted { id, active: true })?;
     }
-    drop(capture);
-    actor.finish_pending("voice call stopped");
-    child.wait_for_exit()?;
-    Ok(())
+    let capture = InputCapture::start(writer, failure_tx)?;
+    let control = Arc::new(SessionControl {
+        commands: command_tx,
+        running: Arc::clone(&running),
+        ready: ready.clone(),
+        non_blocking: Arc::clone(non_blocking),
+        stop_requested: Arc::clone(stop_requested),
+        muted: Arc::clone(&actor.muted),
+        stream,
+        session_arguments: arguments,
+    });
+    Ok(StartedSession {
+        child,
+        actor,
+        control,
+        capture,
+        failure_rx,
+        running,
+    })
 }
 
 fn default_input_during_tts_policy() -> InputDuringTtsPolicy {
@@ -117,32 +268,158 @@ fn default_input_during_tts_policy() -> InputDuringTtsPolicy {
 
 #[derive(Clone)]
 struct ReadyState {
-    session: VoiceSessionSnapshot,
+    session: Arc<Mutex<VoiceSessionSnapshot>>,
 }
 
 enum ControlCommand {
+    InputDuringTts {
+        policy: InputDuringTtsPolicy,
+        expected_revision: u64,
+        response: SyncSender<Result<Value, String>>,
+    },
+    Muted {
+        muted: bool,
+        response: SyncSender<Result<Value, String>>,
+    },
+    TtsSettings {
+        settings: berd_call::TtsSettings,
+        expected_revision: u64,
+        response: SyncSender<Result<Value, String>>,
+    },
     Speak {
         text: String,
         acknowledgement: Option<u64>,
         resolved_handoff_ids: Vec<String>,
+        non_blocking: bool,
         response: SyncSender<Result<Value, String>>,
     },
     Stop {
         response: SyncSender<Result<Value, String>>,
     },
+    Restart {
+        arguments: Vec<String>,
+        expert_spokesperson: bool,
+        response: SyncSender<Result<Value, String>>,
+    },
+}
+
+struct PendingRestart {
+    arguments: Vec<String>,
+    expert_spokesperson: bool,
+    response: SyncSender<Result<Value, String>>,
 }
 
 struct SessionControl {
     commands: SyncSender<ControlCommand>,
     running: Arc<AtomicBool>,
     ready: ReadyState,
+    non_blocking: Arc<AtomicBool>,
+    stop_requested: Arc<AtomicBool>,
+    muted: Arc<AtomicBool>,
+    stream: bool,
+    session_arguments: Vec<String>,
+}
+
+impl SessionControl {
+    fn request(
+        &self,
+        command: impl FnOnce(SyncSender<Result<Value, String>>) -> ControlCommand,
+    ) -> Result<Value, String> {
+        let (response, result) = mpsc::sync_channel(1);
+        self.commands
+            .send(command(response))
+            .map_err(|_| "voice call is not running")?;
+        result
+            .recv()
+            .map_err(|_| "voice call stopped during settings update")?
+    }
 }
 
 impl HostControl for SessionControl {
+    fn set_tts(&self, settings: berd_call::TtsSettings) -> Result<Value, String> {
+        let expected_revision = self
+            .ready
+            .session
+            .lock()
+            .map_err(|_| "session settings lock failed")?
+            .tts
+            .revision;
+        self.request(|response| ControlCommand::TtsSettings {
+            settings,
+            expected_revision,
+            response,
+        })
+    }
+
+    fn set_rate(&self, rate: f32) -> Result<Value, String> {
+        let (settings, expected_revision) = {
+            let session = self
+                .ready
+                .session
+                .lock()
+                .map_err(|_| "session settings lock failed")?;
+            (
+                session.tts.settings.clone().with_rate(rate),
+                session.tts.revision,
+            )
+        };
+        self.request(|response| ControlCommand::TtsSettings {
+            settings,
+            expected_revision,
+            response,
+        })
+    }
+
+    fn set_input_during_tts(&self, policy: InputDuringTtsPolicy) -> Result<Value, String> {
+        let expected_revision = self
+            .ready
+            .session
+            .lock()
+            .map_err(|_| "session settings lock failed")?
+            .input_during_tts
+            .revision;
+        self.request(|response| ControlCommand::InputDuringTts {
+            policy,
+            expected_revision,
+            response,
+        })
+    }
+
+    fn set_muted(&self, muted: bool) -> Result<Value, String> {
+        self.request(|response| ControlCommand::Muted { muted, response })?;
+        self.status()
+    }
+
+    fn restart(&self, session_arguments: Vec<String>) -> Result<Value, String> {
+        let expert_spokesperson = crate::validate_session_arguments(&session_arguments)?;
+        let (response, result) = mpsc::sync_channel(1);
+        self.commands
+            .send(ControlCommand::Restart {
+                arguments: session_arguments,
+                expert_spokesperson,
+                response,
+            })
+            .map_err(|_| "voice call is not running")?;
+        result
+            .recv()
+            .map_err(|_| "voice call stopped during restart".to_string())?
+    }
+
+    fn set_non_blocking(&self, enabled: bool) -> Result<Value, String> {
+        if enabled && !self.stream {
+            return Err("non-blocking speech requires start --stream for delivery events".into());
+        }
+        self.non_blocking.store(enabled, Ordering::SeqCst);
+        self.status()
+    }
+
     fn status(&self) -> Result<Value, String> {
         Ok(json!({
             "running": self.running.load(Ordering::SeqCst),
-            "session": self.ready.session,
+            "session": *self.ready.session.lock().map_err(|_| "session settings lock failed")?,
+            "nonBlocking": self.non_blocking.load(Ordering::SeqCst),
+            "muted": self.muted.load(Ordering::SeqCst),
+            "sessionArguments": &self.session_arguments[1..],
         }))
     }
 
@@ -158,6 +435,7 @@ impl HostControl for SessionControl {
                 text,
                 acknowledgement,
                 resolved_handoff_ids,
+                non_blocking: self.non_blocking.load(Ordering::SeqCst),
                 response: tx,
             })
             .map_err(|_| "voice call is not running".to_string())?;
@@ -166,18 +444,30 @@ impl HostControl for SessionControl {
     }
 
     fn stop(&self) -> Result<Value, String> {
+        // Recorded before enqueueing, so a stop that races a restart handoff
+        // still ends the call even if this session never reads the command.
+        self.stop_requested.store(true, Ordering::SeqCst);
         let (tx, rx) = mpsc::sync_channel(1);
-        self.commands
+        if self
+            .commands
             .send(ControlCommand::Stop { response: tx })
-            .map_err(|_| "voice call is not running".to_string())?;
-        rx.recv_timeout(Duration::from_secs(5))
-            .map_err(|_| "timed out stopping voice call".to_string())?
+            .is_err()
+        {
+            return Ok(json!({"stopping":true}));
+        }
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Disconnected) => Ok(json!({"stopping":true})),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err("timed out stopping voice call".into()),
+        }
     }
 }
 
 struct PendingSpeak {
     prepare_id: u64,
-    response: SyncSender<Result<Value, String>>,
+    text: String,
+    non_blocking: bool,
+    response: Option<SyncSender<Result<Value, String>>>,
 }
 
 enum AudioCommand {
@@ -192,9 +482,14 @@ struct SessionActor {
     audio_commands: SyncSender<AudioCommand>,
     next_id: u64,
     pending_speak: Option<PendingSpeak>,
+    pending_settings: std::collections::HashMap<u64, SyncSender<Result<Value, String>>>,
+    waiting_speaks: VecDeque<ControlCommand>,
+    session: Arc<Mutex<VoiceSessionSnapshot>>,
     stream: bool,
     expert_spokesperson: bool,
     stopping: bool,
+    restart: Option<PendingRestart>,
+    muted: Arc<AtomicBool>,
 }
 
 impl SessionActor {
@@ -203,6 +498,7 @@ impl SessionActor {
         events: Receiver<SessionMessage>,
         commands: Receiver<ControlCommand>,
         audio_commands: SyncSender<AudioCommand>,
+        session: Arc<Mutex<VoiceSessionSnapshot>>,
         stream: bool,
         expert_spokesperson: bool,
     ) -> Self {
@@ -213,9 +509,14 @@ impl SessionActor {
             audio_commands,
             next_id: 2,
             pending_speak: None,
+            pending_settings: std::collections::HashMap::new(),
+            waiting_speaks: VecDeque::new(),
+            session,
             stream,
             expert_spokesperson,
             stopping: false,
+            restart: None,
+            muted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -242,19 +543,77 @@ impl SessionActor {
                 }
             }
         }
+        if !self.stopping && self.pending_speak.is_none() {
+            if let Some(command) = self.waiting_speaks.pop_front() {
+                self.handle_command(command)?;
+            }
+        }
         Ok(())
     }
 
     fn handle_command(&mut self, command: ControlCommand) -> Result<(), String> {
         match command {
+            ControlCommand::InputDuringTts {
+                policy,
+                expected_revision,
+                response,
+            } => {
+                let id = self.next_id();
+                send_request(
+                    &self.writer,
+                    &SessionRequest::SetInputDuringTts {
+                        id,
+                        expected_revision,
+                        policy,
+                    },
+                )?;
+                self.pending_settings.insert(id, response);
+            }
+            ControlCommand::Muted { muted, response } => {
+                let id = self.next_id();
+                send_request(
+                    &self.writer,
+                    &SessionRequest::SetInputMuted { id, active: muted },
+                )?;
+                self.pending_settings.insert(id, response);
+            }
+            ControlCommand::TtsSettings {
+                settings,
+                expected_revision,
+                response,
+            } => {
+                let id = self.next_id();
+                send_request(
+                    &self.writer,
+                    &SessionRequest::SetTtsSettings {
+                        id,
+                        expected_revision,
+                        settings,
+                    },
+                )?;
+                self.pending_settings.insert(id, response);
+            }
             ControlCommand::Speak {
                 text,
                 acknowledgement,
                 resolved_handoff_ids,
+                non_blocking,
                 response,
             } => {
+                if non_blocking && !self.stream {
+                    let _ = response.send(Err(
+                        "non-blocking speech requires start --stream for delivery events".into(),
+                    ));
+                    return Ok(());
+                }
                 if self.pending_speak.is_some() {
-                    let _ = response.send(Err("speech is already in progress".into()));
+                    self.waiting_speaks.push_back(ControlCommand::Speak {
+                        text,
+                        acknowledgement,
+                        resolved_handoff_ids,
+                        non_blocking,
+                        response,
+                    });
                     return Ok(());
                 }
                 let id = self.next_id();
@@ -263,26 +622,94 @@ impl SessionActor {
                     &SessionRequest::PrepareSpeak {
                         id,
                         acknowledgement,
-                        text,
+                        text: text.clone(),
                         resolved_handoff_ids,
                     },
                 )?;
                 self.pending_speak = Some(PendingSpeak {
                     prepare_id: id,
+                    text,
+                    non_blocking,
+                    response: Some(response),
+                });
+            }
+            ControlCommand::Restart {
+                arguments,
+                expert_spokesperson,
+                response,
+            } => {
+                if self.stopping {
+                    let _ = response.send(Err("voice call is stopping".into()));
+                    return Ok(());
+                }
+                send_request(&self.writer, &SessionRequest::Shutdown)?;
+                self.stopping = true;
+                self.restart = Some(PendingRestart {
+                    arguments,
+                    expert_spokesperson,
                     response,
                 });
             }
             ControlCommand::Stop { response } => {
-                send_request(&self.writer, &SessionRequest::Shutdown)?;
-                self.stopping = true;
+                self.stop()?;
                 let _ = response.send(Ok(json!({"stopping":true})));
             }
         }
         Ok(())
     }
 
+    /// Ends the call, cancelling any restart it would otherwise hand off to.
+    fn stop(&mut self) -> Result<(), String> {
+        if let Some(restart) = self.restart.take() {
+            let _ = restart.response.send(Err("voice call stopped".into()));
+        }
+        if !self.stopping {
+            send_request(&self.writer, &SessionRequest::Shutdown)?;
+            self.stopping = true;
+        }
+        Ok(())
+    }
+
     fn handle_event(&mut self, event: SessionMessage) -> Result<(), String> {
         match event {
+            SessionMessage::TtsSettingsResult {
+                id,
+                outcome,
+                snapshot,
+                message,
+            } => {
+                if let Ok(mut session) = self.session.lock() {
+                    if snapshot.revision >= session.tts.revision {
+                        session.tts = snapshot.clone();
+                    }
+                }
+                if let Some(response) = self.pending_settings.remove(&id) {
+                    let _ = response.send(Ok(
+                        json!({"outcome":outcome,"snapshot":snapshot,"message":message}),
+                    ));
+                }
+            }
+            SessionMessage::InputDuringTtsResult {
+                id,
+                outcome,
+                snapshot,
+            } => {
+                if let Ok(mut session) = self.session.lock() {
+                    if snapshot.revision >= session.input_during_tts.revision {
+                        session.input_during_tts = snapshot;
+                    }
+                }
+                if let Some(response) = self.pending_settings.remove(&id) {
+                    let _ = response.send(Ok(json!({"outcome":outcome,"snapshot":snapshot})));
+                }
+            }
+            SessionMessage::InputMuteApplied { id, active } => {
+                // Commit before acknowledging so a restart cannot read a stale value.
+                self.muted.store(active, Ordering::SeqCst);
+                if let Some(response) = self.pending_settings.remove(&id) {
+                    let _ = response.send(Ok(json!({"muted":active})));
+                }
+            }
             SessionMessage::LiveEvent {
                 token,
                 text,
@@ -306,10 +733,17 @@ impl SessionActor {
                 send_request(&self.writer, &SessionRequest::OutputReady { id, speech_id })?;
             }
             SessionMessage::OutputReadyResult { id, outcome, .. }
-                if self.pending_prepare_id() == Some(id)
-                    && outcome != OutputReadyOutcome::Accepted =>
+                if self.pending_prepare_id() == Some(id) =>
             {
-                self.respond_speak(Err("speech output reservation became stale".into()));
+                if outcome != OutputReadyOutcome::Accepted {
+                    self.respond_speak(Err("speech output reservation became stale".into()));
+                } else if let Some(pending) = self.pending_speak.as_mut() {
+                    if pending.non_blocking {
+                        if let Some(response) = pending.response.take() {
+                            let _ = response.send(Ok(json!({"status":"accepted", "requestId":id})));
+                        }
+                    }
+                }
             }
             SessionMessage::SpeechCompleted { id, .. } if self.pending_prepare_id() == Some(id) => {
                 self.respond_speak(Ok(json!({"spoke":true,"status":"completed"})));
@@ -319,10 +753,19 @@ impl SessionActor {
                 spoken_through_utf8,
                 ..
             } if self.pending_prepare_id() == Some(id) => {
+                let spoken_text = estimated_spoken_text(
+                    &self
+                        .pending_speak
+                        .as_ref()
+                        .expect("matched pending speech")
+                        .text,
+                    spoken_through_utf8,
+                );
                 self.respond_speak(Ok(json!({
                     "spoke":true,
                     "status":"interrupted",
                     "spokenThroughUtf8":spoken_through_utf8,
+                    "estimatedSpokenText":spoken_text,
                 })));
             }
             SessionMessage::SpeechFailed { id, message, .. }
@@ -358,7 +801,18 @@ impl SessionActor {
 
     fn respond_speak(&mut self, result: Result<Value, String>) {
         if let Some(pending) = self.pending_speak.take() {
-            let _ = pending.response.send(result);
+            if let Some(response) = pending.response {
+                let _ = response.send(result);
+            } else {
+                let result = match result {
+                    Ok(value) => value,
+                    Err(message) => json!({"status":"failed", "message":message}),
+                };
+                if should_notify_delivery(&result) {
+                    println!("{}\tspeech_result\t{}", pending.prepare_id, result);
+                    let _ = std::io::stdout().flush();
+                }
+            }
         }
     }
 
@@ -397,7 +851,15 @@ impl SessionActor {
     }
 
     fn finish_pending(&mut self, message: &str) {
+        for (_, response) in self.pending_settings.drain() {
+            let _ = response.send(Err(message.to_string()));
+        }
         self.respond_speak(Err(message.to_string()));
+        for command in self.waiting_speaks.drain(..) {
+            if let ControlCommand::Speak { response, .. } = command {
+                let _ = response.send(Err(message.to_string()));
+            }
+        }
     }
 }
 
@@ -431,7 +893,9 @@ fn receive_ready(events: &Receiver<SessionMessage>) -> Result<ReadyState, String
             id: 1,
             protocol: SESSION_PROTOCOL_VERSION,
             session,
-        } => Ok(ReadyState { session }),
+        } => Ok(ReadyState {
+            session: Arc::new(Mutex::new(session)),
+        }),
         SessionMessage::Fatal { message } => Err(message),
         _ => Err("voice session returned an invalid ready handshake".into()),
     }
@@ -1140,6 +1604,20 @@ fn stream_text(text: &str) -> String {
     text.replace(['\r', '\n', '\t'], " ")
 }
 
+fn estimated_spoken_text(text: &str, through_utf8: u64) -> &str {
+    let mut end = usize::try_from(through_utf8)
+        .unwrap_or(usize::MAX)
+        .min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn should_notify_delivery(result: &Value) -> bool {
+    result.get("status").and_then(Value::as_str) != Some("completed")
+}
+
 fn suspension_settle_time(route_latency: Duration) -> Duration {
     route_latency
 }
@@ -1175,6 +1653,237 @@ fn expert_delivery_role_name(role: RealtimeExpertDeliveryRole) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speak_waits_for_pending_delivery_and_shutdown_releases_waiters() {
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let writer = Arc::new(Mutex::new(child.stdin.take().unwrap()));
+        let (_events_tx, events) = mpsc::sync_channel(1);
+        let (_commands_tx, commands) = mpsc::sync_channel(1);
+        let (audio_commands, _audio_rx) = mpsc::sync_channel(1);
+        let mut actor = test_actor(writer, events, commands, audio_commands);
+        let (first_tx, first_rx) = mpsc::sync_channel(1);
+        actor.pending_speak = Some(PendingSpeak {
+            prepare_id: 2,
+            text: "first".into(),
+            non_blocking: false,
+            response: Some(first_tx),
+        });
+        let (next_tx, next_rx) = mpsc::sync_channel(1);
+        actor
+            .handle_command(ControlCommand::Speak {
+                text: "next".into(),
+                acknowledgement: Some(7),
+                resolved_handoff_ids: Vec::new(),
+                non_blocking: true,
+                response: next_tx,
+            })
+            .unwrap();
+        assert!(matches!(next_rx.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(actor.waiting_speaks.len(), 1);
+        actor.finish_pending("voice call stopped");
+        assert!(first_rx.recv().unwrap().is_err());
+        assert!(next_rx.recv().unwrap().is_err());
+        assert!(actor.waiting_speaks.is_empty());
+        drop(actor);
+        assert!(child.wait().unwrap().success());
+    }
+
+    fn test_snapshot() -> VoiceSessionSnapshot {
+        VoiceSessionSnapshot {
+            tts: berd_call::TtsConfigurationSnapshot {
+                revision: 1,
+                settings: berd_call::TtsSettings::Siri {
+                    voice: "Aaron".into(),
+                    language: "en-US".into(),
+                    rate: 1.0,
+                },
+            },
+            input_during_tts: berd_call::input::InputDuringTtsSnapshot {
+                revision: 1,
+                policy: InputDuringTtsPolicy::AllowBargeIn,
+            },
+        }
+    }
+
+    fn test_actor(
+        writer: Arc<Mutex<ChildStdin>>,
+        events: Receiver<SessionMessage>,
+        commands: Receiver<ControlCommand>,
+        audio_commands: SyncSender<AudioCommand>,
+    ) -> SessionActor {
+        let session = Arc::new(Mutex::new(test_snapshot()));
+        SessionActor::new(
+            writer,
+            events,
+            commands,
+            audio_commands,
+            session,
+            true,
+            false,
+        )
+    }
+
+    #[test]
+    fn mute_is_committed_before_it_is_acknowledged() {
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let writer = Arc::new(Mutex::new(child.stdin.take().unwrap()));
+        let (_events_tx, events) = mpsc::sync_channel(1);
+        let (_commands_tx, commands) = mpsc::sync_channel(1);
+        let (audio_commands, _audio_rx) = mpsc::sync_channel(1);
+        let mut actor = test_actor(writer, events, commands, audio_commands);
+        let muted = Arc::clone(&actor.muted);
+        let (response, acknowledged) = mpsc::sync_channel(1);
+        let id = actor.next_id;
+        actor
+            .handle_command(ControlCommand::Muted {
+                muted: true,
+                response,
+            })
+            .unwrap();
+        actor
+            .handle_event(SessionMessage::InputMuteApplied { id, active: true })
+            .unwrap();
+        acknowledged.recv().unwrap().unwrap();
+        // A restart that runs before the caller resumes reads this flag.
+        assert!(muted.load(Ordering::SeqCst));
+        drop(actor);
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn stop_is_recorded_even_when_the_session_never_reads_it() {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let control = SessionControl {
+            commands,
+            running: Arc::new(AtomicBool::new(false)),
+            ready: ReadyState {
+                session: Arc::new(Mutex::new(test_snapshot())),
+            },
+            non_blocking: Arc::new(AtomicBool::new(false)),
+            stop_requested: Arc::clone(&stop_requested),
+            muted: Arc::new(AtomicBool::new(false)),
+            stream: false,
+            session_arguments: vec!["session".into()],
+        };
+        drop(receiver);
+        assert_eq!(control.stop().unwrap(), json!({"stopping":true}));
+        assert!(stop_requested.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn rate_updates_keep_the_current_voice_and_revision() {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let control = SessionControl {
+            commands,
+            running: Arc::new(AtomicBool::new(true)),
+            ready: ReadyState {
+                session: Arc::new(Mutex::new(test_snapshot())),
+            },
+            non_blocking: Arc::new(AtomicBool::new(false)),
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            muted: Arc::new(AtomicBool::new(false)),
+            stream: false,
+            session_arguments: vec!["session".into()],
+        };
+        let worker = thread::spawn(move || match receiver.recv().unwrap() {
+            ControlCommand::TtsSettings {
+                settings,
+                expected_revision,
+                response,
+            } => {
+                response.send(Ok(json!({}))).unwrap();
+                (settings, expected_revision)
+            }
+            _ => panic!("expected a TTS settings command"),
+        });
+        control.set_rate(1.5).unwrap();
+        assert_eq!(
+            worker.join().unwrap(),
+            (
+                berd_call::TtsSettings::Siri {
+                    voice: "Aaron".into(),
+                    language: "en-US".into(),
+                    rate: 1.5,
+                },
+                1
+            )
+        );
+    }
+
+    #[test]
+    fn stop_cancels_a_pending_restart() {
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let writer = Arc::new(Mutex::new(child.stdin.take().unwrap()));
+        let (_events_tx, events) = mpsc::sync_channel(1);
+        let (_commands_tx, commands) = mpsc::sync_channel(1);
+        let (audio_commands, _audio_rx) = mpsc::sync_channel(1);
+        let mut actor = test_actor(writer, events, commands, audio_commands);
+        let (restart_tx, restart_rx) = mpsc::sync_channel(1);
+        actor
+            .handle_command(ControlCommand::Restart {
+                arguments: vec!["session".into()],
+                expert_spokesperson: false,
+                response: restart_tx,
+            })
+            .unwrap();
+        let (stop_tx, stop_rx) = mpsc::sync_channel(1);
+        actor
+            .handle_command(ControlCommand::Stop { response: stop_tx })
+            .unwrap();
+        assert!(actor.restart.is_none());
+        assert!(restart_rx.recv().unwrap().is_err());
+        assert!(stop_rx.recv().unwrap().is_ok());
+        let (late_tx, late_rx) = mpsc::sync_channel(1);
+        actor
+            .handle_command(ControlCommand::Restart {
+                arguments: vec!["session".into()],
+                expert_spokesperson: false,
+                response: late_tx,
+            })
+            .unwrap();
+        assert!(actor.restart.is_none());
+        assert!(late_rx.recv().unwrap().is_err());
+        drop(actor);
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn non_blocking_delivery_assumes_success_but_reports_actionable_results() {
+        assert!(!should_notify_delivery(
+            &json!({"spoke":true,"status":"completed"})
+        ));
+        assert!(should_notify_delivery(
+            &json!({"spoke":true,"status":"interrupted"})
+        ));
+        assert!(should_notify_delivery(
+            &json!({"status":"failed","message":"output failed"})
+        ));
+        assert!(should_notify_delivery(
+            &json!({"spoke":false,"utterances":[{"token":2,"text":"stop"}]})
+        ));
+    }
+
+    #[test]
+    fn estimated_speech_uses_utf8_bytes_without_splitting_characters() {
+        assert_eq!(estimated_spoken_text("Hi, René!", 0), "");
+        assert_eq!(estimated_spoken_text("Hi, René!", 8), "Hi, Ren");
+        assert_eq!(estimated_spoken_text("Hi, René!", 9), "Hi, René");
+        assert_eq!(estimated_spoken_text("Hi, René!", u64::MAX), "Hi, René!");
+    }
 
     #[test]
     fn input_normalizer_emits_exact_twenty_millisecond_frames() {

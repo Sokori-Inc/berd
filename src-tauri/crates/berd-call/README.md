@@ -48,6 +48,35 @@ suppresses recognition during playback when the default output
 identifies itself as built-in speakers, preventing the call from transcribing
 its own speech; headphone-like outputs retain barge-in.
 
+`speak` waits for delivery by default. Interrupted results contain
+`spokenThroughUtf8` and `estimatedSpokenText`, a best-effort prefix of the
+submitted text. To return without waiting for delivery, start the call with
+`--stream --non-blocking`, or change the live session using
+`berd-call settings --non-blocking true`. Speak calls inherit this setting;
+they wait for pending speech before attempting admission. The command returns `status: accepted` and a
+`requestId`; a later `speech_result` TSV row uses that request ID in its first
+column and contains the JSON delivery result in its text column. Successful
+delivery stays silent; only interruptions and failures produce result rows. Newly
+finalized user input and admission failures are returned directly by `speak`.
+These IDs
+identify speech requests, not transcript cursors, and must not be passed as
+`--re` acknowledgements. Acceptance means the runtime admitted playback.
+
+Use `berd-call settings --tts '{"backend":"siri","voice":"Aaron","language":"en-US","rate":1.5}'`
+to update the running call through the runtime's revision-checked TTS settings.
+The result includes `outcome` and the acknowledged `snapshot`; `status` reflects
+that snapshot. Changes apply to subsequent speech without restarting the call.
+
+Use `berd-call settings --input-during-tts allow|suppress` to change whether
+microphone input can interrupt speech, and `berd-call settings --muted true|false`
+to mute or unmute microphone input. Both apply live and are reflected by `status`.
+
+Settings the runtime cannot change live, such as STT backend or call mode, use
+`berd-call settings --restart [session options]`. The replacement options are
+complete `berd-call session` options. The call keeps its control port, stream,
+blocking policy, mute state, and input-during-TTS policy; the stream emits a lifecycle row because
+transcript cursors restart with the new session.
+
 This crate owns the neutral PCM output contract and backend-neutral TTS stream
 used by Berd, plus the April ONNX runtime and text chunking used by Berd's native
 voice commands. It also owns the concrete Parakeet model loader and complete
